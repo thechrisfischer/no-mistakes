@@ -1232,7 +1232,8 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	if state.Safety == "blocked_branch_ambiguous" {
 		return state
 	}
-	if run != nil && run.TerminalAdoptionAuthorizedAt != nil && run.LastPushedSHA == nil && run.PRURL == nil {
+	if run != nil && run.TerminalAdoptionAuthorizedAt != nil && run.LastPushedSHA == nil && run.PRURL == nil &&
+		(run.CustodyReturnedAt == nil || s.terminalAdoptionLaneStale(ctx, run)) {
 		if keepLocal {
 			return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_keep_local", "this run already records an exact terminal-head adoption; use its fully bound replay instead of changing the authorized recovery to keep-local; no files, refs, or custody records were changed", terminalHeadAdoptionRequestFor(s.Repo, run))
 		}
@@ -3197,6 +3198,17 @@ func RunHeadUnmoved(state State) bool {
 	return state.Pipeline.SubmittedHead != "" && state.Pipeline.CurrentHead == state.Pipeline.SubmittedHead
 }
 
+// terminalAdoptionLaneStale reports a recorded adoption whose private gate
+// lane still directly names the caller head the adoption replaced.
+func (s *Service) terminalAdoptionLaneStale(ctx context.Context, run *db.Run) bool {
+	request := terminalHeadAdoptionRequestFor(s.Repo, run)
+	if request.RepositoryID == "" {
+		return false
+	}
+	lane, exists, err := git.DirectCommitRefTarget(ctx, strings.TrimSpace(s.GateDir), "refs/heads/"+run.Branch)
+	return err == nil && exists && lane == request.CallerHead
+}
+
 // classifyCustodyReturned reports a branch whose stranded terminal run was
 // explicitly recovered and never had a push binding. A diverged local head is
 // not ready to start a fresh run until the gate lane has safely adopted the
@@ -3209,15 +3221,11 @@ func (s *Service) classifyCustodyReturned(ctx context.Context, state *State, run
 		offerTerminalAdoptionReplay(state, request)
 		return
 	}
-	if run.TerminalAdoptionAuthorizedAt != nil {
-		request := terminalHeadAdoptionRequestFor(s.Repo, run)
-		lane, exists, err := git.DirectCommitRefTarget(ctx, strings.TrimSpace(s.GateDir), "refs/heads/"+run.Branch)
-		if err == nil && exists && lane == request.CallerHead {
-			state.Safety = "blocked_adopt_terminal_replay_mismatch"
-			state.Error = "the recorded adoption has a stale private mirror lane, but replay requires the authorized branch clean at the exact preserved head and verified history anchors; preserve later commits and uncommitted work separately and obtain verified recovery guidance; no files or refs were changed"
-			state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
-			return
-		}
+	if run.TerminalAdoptionAuthorizedAt != nil && s.terminalAdoptionLaneStale(ctx, run) {
+		state.Safety = "blocked_adopt_terminal_replay_mismatch"
+		state.Error = "the recorded adoption has a stale private mirror lane, but replay requires the authorized branch clean at the exact preserved head and verified history anchors; preserve later commits and uncommitted work separately and obtain verified recovery guidance; no files or refs were changed"
+		state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
+		return
 	}
 	if state.Relation == RelationDiverged {
 		branchRef := "refs/heads/" + state.Local.Branch

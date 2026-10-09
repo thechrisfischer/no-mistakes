@@ -729,6 +729,62 @@ func TestAdoptTerminalHeadCompletedStatusOffersOnlyExactStaleLaneReplay(t *testi
 	}
 }
 
+// TestRecoverAfterSettledAdoptionStaysAnIdempotentNoop keeps a completed
+// adoption whose lane is already settled (or absent) on the ordinary
+// custody-returned no-op for plain and keep-local recovery, even after later
+// operator work, while a still-stale caller-head lane keeps routing through
+// the bound replay and refuses rather than reporting readiness.
+func TestRecoverAfterSettledAdoptionStaysAnIdempotentNoop(t *testing.T) {
+	t.Parallel()
+	for _, lane := range []string{"settled", "absent", "stale"} {
+		for _, work := range []string{"later commit", "dirty"} {
+			for _, keepLocal := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/keep-local=%v", lane, work, keepLocal), func(t *testing.T) {
+					t.Parallel()
+					f := newStaleMirrorAdoptionFixture(t)
+					if result := f.service.AdoptTerminalHead(f.ctx, terminalHeadAdoptionRequest(f)); !result.Recovered {
+						t.Fatalf("adoption = %#v", result)
+					}
+					switch lane {
+					case "absent":
+						mustRun(t, f.gate, "update-ref", "-d", "refs/heads/"+f.run.Branch, f.preserved)
+					case "stale":
+						mustRun(t, f.gate, "update-ref", "refs/heads/"+f.run.Branch, f.submitted, f.preserved)
+					}
+					switch work {
+					case "later commit":
+						mustRun(t, f.local, "commit", "--allow-empty", "-m", "later work")
+					case "dirty":
+						mustWrite(t, filepath.Join(f.local, "later.txt"), "uncommitted work\n")
+					}
+					head := mustRun(t, f.local, "rev-parse", "HEAD")
+					laneBefore := f.mirrorLane()
+
+					result := f.service.Recover(f.ctx, keepLocal)
+					if lane == "stale" {
+						if result.Recovered || !strings.HasPrefix(result.Safety, "blocked_adopt_terminal_") {
+							t.Fatalf("stale lane recovery reported readiness: %#v", result)
+						}
+					} else if !result.Recovered || result.Changed {
+						t.Fatalf("settled adoption recovery = %#v", result)
+					}
+					if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != head {
+						t.Fatalf("recovery moved HEAD to %s, want %s", got, head)
+					}
+					if got := f.mirrorLane(); got != laneBefore {
+						t.Fatalf("recovery moved the lane to %q, want %q", got, laneBefore)
+					}
+					if work == "dirty" {
+						if status := mustRun(t, f.local, "status", "--porcelain"); !strings.Contains(status, "later.txt") {
+							t.Fatalf("recovery discarded uncommitted work: %q", status)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestAdoptTerminalHeadCallerAnchorDisappearsAfterMirrorMove(t *testing.T) {
 	t.Parallel()
 	f := newStaleMirrorAdoptionFixture(t)
