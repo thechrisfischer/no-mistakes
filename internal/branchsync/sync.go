@@ -192,6 +192,9 @@ type Service struct {
 	beforeRecoverRebind               func()
 	afterTerminalAdoptionAuthorized   func()
 	afterTerminalAdoptionPreserved    func()
+	afterTerminalAdoptionMirrorAnchor func()
+	afterTerminalAdoptionMirrorMove   func()
+	afterTerminalAdoptionSettlement   func()
 	completeTerminalAdoption          func(db.TerminalHeadAdoptionAuthorization) (bool, error)
 }
 
@@ -643,7 +646,7 @@ func (s *Service) automaticTerminalAdoptionAvailable(ctx context.Context, proofD
 		s.trustedTerminalEqualTreeRewrite(ctx, state, run))
 }
 
-func terminalHeadAdoptionRequestFor(repo *db.Repo, state State, run *db.Run) TerminalHeadAdoptionRequest {
+func terminalHeadAdoptionRequestFor(repo *db.Repo, run *db.Run) TerminalHeadAdoptionRequest {
 	request := TerminalHeadAdoptionRequest{}
 	if repo == nil || run == nil || run.SubmittedHeadSHA == nil {
 		return request
@@ -670,7 +673,7 @@ func terminalHeadAdoptionCommand(request TerminalHeadAdoptionRequest) string {
 // recognizes the exact terminal, unpublished, clean submitted-head state for
 // which status may offer an operator-confirmed action.
 func (s *Service) terminalHeadAdoptionCandidate(ctx context.Context, state State, run *db.Run) (TerminalHeadAdoptionRequest, bool) {
-	request := terminalHeadAdoptionRequestFor(s.Repo, state, run)
+	request := terminalHeadAdoptionRequestFor(s.Repo, run)
 	if request.RepositoryID == "" || state.State != StatePipelineOwned || state.Local.Branch != request.Branch || state.Local.Head != request.CallerHead || !state.Local.Clean ||
 		run.RepoID != request.RepositoryID || !terminalRunStatus(run.Status) || run.TerminalHeadVerifiedAt == nil || run.CustodyReturnedAt != nil || run.PushActive ||
 		run.LastPushedSHA != nil || run.PRURL != nil || request.CallerHead == request.PreservedHead {
@@ -689,15 +692,125 @@ func (s *Service) terminalHeadAdoptionCandidate(ctx context.Context, state State
 	if compatible, err := exactCommitRefCompatible(ctx, s.workDir(), custody.RecoveryLocalRef(run.ID), request.CallerHead); err != nil || !compatible {
 		return TerminalHeadAdoptionRequest{}, false
 	}
+	if _, settleable := terminalAdoptionMirrorSettleable(ctx, gateDir, run.ID, request); !settleable {
+		return TerminalHeadAdoptionRequest{}, false
+	}
 	if s.automaticTerminalAdoptionAvailable(ctx, gateDir, state, run) {
 		return TerminalHeadAdoptionRequest{}, false
 	}
 	return request, true
 }
 
+// recordedTerminalAdoptionReplay offers only an already-authorized exact result;
+// ordinary recovery must not stamp custody while its mirror settlement is pending.
+func (s *Service) recordedTerminalAdoptionReplay(ctx context.Context, state State, run *db.Run) (TerminalHeadAdoptionRequest, bool) {
+	request := terminalHeadAdoptionRequestFor(s.Repo, run)
+	if run == nil || request.RepositoryID == "" || run.RepoID != request.RepositoryID || run.ID != state.Pipeline.RunID ||
+		!terminalRunStatus(run.Status) || run.TerminalHeadVerifiedAt == nil || run.PushActive || run.LastPushedSHA != nil || run.PRURL != nil ||
+		request.CallerHead == request.PreservedHead || !terminalHeadAdoptionAuthorizationMatches(run, request) ||
+		!s.terminalAdoptionCallerExact(ctx, run.ID, request) {
+		return TerminalHeadAdoptionRequest{}, false
+	}
+	lane, settleable := terminalAdoptionMirrorSettleable(ctx, strings.TrimSpace(s.GateDir), run.ID, request)
+	if !settleable || (run.CustodyReturnedAt != nil && lane != request.CallerHead) {
+		return TerminalHeadAdoptionRequest{}, false
+	}
+	return request, true
+}
+
+func offerTerminalAdoptionReplay(state *State, request TerminalHeadAdoptionRequest) {
+	state.Safety = "blocked_terminal_head_adoption_replay_required"
+	state.Error = "the recorded terminal-head adoption requires its fully bound replay to settle the private mirror; keep the branch clean at the exact preserved head and run the offered command before starting another run"
+	state.Recovery = terminalHeadAdoptionEvidence(request, "operator_authorized")
+	state.NextAction = &NextAction{Code: "adopt_terminal_head", Command: terminalHeadAdoptionCommand(request)}
+}
+
+// terminalAdoptionMirrorSettleable reports whether adoption can leave the
+// private gate lane ready for the next run. The lane must be absent, still at
+// the authorized caller head (the head the terminal run was submitted with),
+// or already at the preserved head, and the gate's caller-head anchor must be
+// absent or name exactly the caller head. Any other lane is someone else's
+// evidence: adoption never moves it and refuses instead. It also returns the
+// lane it read ("" when absent), so settlement acts on this one checked read:
+// an unreadable, symbolic, or non-commit lane is never mistaken for absent.
+func terminalAdoptionMirrorSettleable(ctx context.Context, gateDir, runID string, request TerminalHeadAdoptionRequest) (string, bool) {
+	if compatible, err := exactCommitRefCompatible(ctx, gateDir, custody.RecoveryLocalRef(runID), request.CallerHead); err != nil || !compatible {
+		return "", false
+	}
+	lane, exists, err := git.DirectCommitRefTarget(ctx, gateDir, "refs/heads/"+request.Branch)
+	if err != nil {
+		return "", false
+	}
+	if !exists {
+		return "", true
+	}
+	return lane, lane == request.CallerHead || lane == request.PreservedHead
+}
+
+// settleTerminalAdoptionMirror moves the private gate lane off the superseded
+// caller head once adoption has put the invoking branch on the preserved head.
+// Without it the lane keeps the submitted head, whose rewritten commits no
+// recovery anchor reaches, so the next run's private-mirror preparation
+// rightly refuses them as at-risk and the adopted branch can never be
+// submitted.
+//
+// It uses only the existing custody machinery. The caller head is first pinned
+// in the gate under its run-specific refs/no-mistakes/recover-local/<run>
+// anchor (create-only, never replaced), so both histories stay reachable in
+// the gate as well as the invoking worktree. The lane then moves with an
+// atomic update-ref compare-and-swap from exactly the caller head, the same
+// gate-side move keep-local recovery uses; it is never a push, which would
+// fire the receive hook and start a run. A lane already at the preserved head
+// or absent needs nothing, which makes every interruption replayable. A lane
+// anywhere else, or a conflicting anchor, refuses without mutation. This is
+// not containment evidence and does not touch the mirror guard: the next run's
+// preparation simply finds the lane equal to (or an ancestor of) its head.
+func (s *Service) settleTerminalAdoptionMirror(ctx context.Context, runID string, request TerminalHeadAdoptionRequest) (string, string, bool) {
+	gateDir := strings.TrimSpace(s.GateDir)
+	branchRef := "refs/heads/" + request.Branch
+	gateAnchor := custody.RecoveryLocalRef(runID)
+	if _, err := os.Stat(gateDir); err != nil {
+		return "blocked_adopt_terminal_mirror_unavailable", "the local gate is unavailable, so the private mirror lane could not be settled; both histories remain anchored", false
+	}
+	lane, settleable := terminalAdoptionMirrorSettleable(ctx, gateDir, runID, request)
+	if !settleable {
+		return "blocked_adopt_terminal_mirror_mismatch", fmt.Sprintf("the private mirror lane %s or its caller-head anchor %s is unreadable or no longer matches the authorized caller or preserved head; it was not moved and both histories remain anchored", branchRef, gateAnchor), false
+	}
+	if lane == "" || lane == request.PreservedHead {
+		return "", "", true
+	}
+	if !exactExistingCommitRef(ctx, gateDir, custody.RecoveryRef(runID), request.PreservedHead) {
+		return "blocked_adopt_terminal_mirror_mismatch", "the run-specific preserved-head anchor no longer matches the authorized preserved head; the private mirror lane was not moved", false
+	}
+	if err := custody.PreserveRecoveryAnchor(ctx, gateDir, gateAnchor, request.CallerHead); err != nil || !exactExistingCommitRef(ctx, gateDir, gateAnchor, request.CallerHead) {
+		return "blocked_adopt_terminal_mirror_preserve_failed", fmt.Sprintf("the superseded caller head could not be anchored at %s in the local gate; the private mirror lane was not moved", gateAnchor), false
+	}
+	if s.afterTerminalAdoptionMirrorAnchor != nil {
+		s.afterTerminalAdoptionMirrorAnchor()
+	}
+	if !exactExistingCommitRef(ctx, gateDir, custody.RecoveryRef(runID), request.PreservedHead) {
+		return "blocked_adopt_terminal_mirror_mismatch", "the run-specific preserved-head anchor changed before the private mirror lane could move; it was not moved", false
+	}
+	if _, err := git.Run(ctx, gateDir, "update-ref", "--no-deref", branchRef, request.PreservedHead, request.CallerHead); err != nil {
+		if current, ok, _ := git.DirectCommitRefTarget(ctx, gateDir, branchRef); !ok || current != request.PreservedHead {
+			return "blocked_adopt_terminal_mirror_race", fmt.Sprintf("the private mirror lane %s changed while adoption was settling it; it was not overwritten and both histories remain anchored", branchRef), false
+		}
+	}
+	if s.afterTerminalAdoptionMirrorMove != nil {
+		s.afterTerminalAdoptionMirrorMove()
+	}
+	if current, ok, err := git.DirectCommitRefTarget(ctx, gateDir, branchRef); err != nil || !ok || current != request.PreservedHead || !exactExistingCommitRef(ctx, gateDir, gateAnchor, request.CallerHead) {
+		return "blocked_adopt_terminal_mirror_race", fmt.Sprintf("the private mirror lane %s or its caller-head anchor changed after adoption settled it", branchRef), false
+	}
+	return "", "", true
+}
+
 func blockedTerminalHeadAdoption(state State, safety, message string, request TerminalHeadAdoptionRequest) State {
 	blocked := blockedPlan(state, state.State, safety, message)
-	if request.RepositoryID != "" {
+	if state.NextAction != nil && state.NextAction.Code == "adopt_terminal_head" && state.Recovery != nil && state.Recovery.Proof == "operator_authorized" {
+		blocked.NextAction = state.NextAction
+		blocked.Recovery = state.Recovery
+	} else if request.RepositoryID != "" {
 		blocked.Recovery = terminalHeadAdoptionEvidence(request, "operator_confirmation_required")
 	}
 	return blocked
@@ -711,29 +824,49 @@ func terminalHeadAdoptionAuthorization(run *db.Run, request TerminalHeadAdoption
 		CallerHeadSHA:    request.CallerHead,
 		PreservedHeadSHA: request.PreservedHead,
 	}
-	if run != nil {
-		auth.Status = run.Status
-		if run.TerminalHeadVerifiedAt != nil {
-			auth.TerminalHeadVerifiedAt = *run.TerminalHeadVerifiedAt
-		}
+	auth.Status = run.Status
+	if run.TerminalHeadVerifiedAt != nil {
+		auth.TerminalHeadVerifiedAt = *run.TerminalHeadVerifiedAt
 	}
 	return auth
 }
 
-func (s *Service) finishTerminalHeadAdoption(ctx context.Context, run *db.Run, request TerminalHeadAdoptionRequest, changed bool) State {
+// terminalAdoptionCallerExact reports whether the invoking worktree is exactly
+// the adopted result: the authorized branch, attached only here, cleanly at the
+// preserved head, with both histories anchored in the gate and the worktree.
+func (s *Service) terminalAdoptionCallerExact(ctx context.Context, runID string, request TerminalHeadAdoptionRequest) bool {
 	wd := s.workDir()
 	branch, branchErr := git.CurrentBranch(ctx, wd)
 	head, headErr := git.HeadSHA(ctx, wd)
 	clean, _ := worktreeClean(ctx, wd)
 	branchCheckouts, branchCheckoutsOK := branchCheckoutCount(ctx, wd, request.Branch)
-	gateDir := strings.TrimSpace(s.GateDir)
-	if branchErr != nil || headErr != nil || branch != request.Branch || head != request.PreservedHead || !clean || !branchCheckoutsOK || branchCheckouts != 1 ||
-		!exactExistingCommitRef(ctx, gateDir, custody.RecoveryRef(run.ID), request.PreservedHead) ||
-		!exactExistingCommitRef(ctx, wd, custody.RecoveryRef(run.ID), request.PreservedHead) ||
-		!exactExistingCommitRef(ctx, wd, custody.RecoveryLocalRef(run.ID), request.CallerHead) {
+	return branchErr == nil && headErr == nil && branch == request.Branch && head == request.PreservedHead && clean && branchCheckoutsOK && branchCheckouts == 1 &&
+		exactExistingCommitRef(ctx, strings.TrimSpace(s.GateDir), custody.RecoveryRef(runID), request.PreservedHead) &&
+		exactExistingCommitRef(ctx, wd, custody.RecoveryRef(runID), request.PreservedHead) &&
+		exactExistingCommitRef(ctx, wd, custody.RecoveryLocalRef(runID), request.CallerHead)
+}
+
+func (s *Service) finishTerminalHeadAdoption(ctx context.Context, run *db.Run, request TerminalHeadAdoptionRequest, changed bool) State {
+	if !s.terminalAdoptionCallerExact(ctx, run.ID, request) {
 		state, _, _ := s.inspect(ctx)
 		state.Changed = changed
 		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_incomplete", "the exact clean preserved branch or one of its required history anchors changed before custody could be recorded; custody was not returned", request)
+	}
+	if safety, message, settled := s.settleTerminalAdoptionMirror(ctx, run.ID, request); !settled {
+		state, _, _ := s.inspect(ctx)
+		state.Changed = changed
+		return blockedTerminalHeadAdoption(state, safety, message+"; custody was not returned", request)
+	}
+	if s.afterTerminalAdoptionSettlement != nil {
+		s.afterTerminalAdoptionSettlement()
+	}
+	// Settlement takes several Git calls; the caller and anchors are proven
+	// again at the stamp, which itself checks only run fields.
+	lane, laneExists, laneErr := git.DirectCommitRefTarget(ctx, strings.TrimSpace(s.GateDir), "refs/heads/"+request.Branch)
+	if !s.terminalAdoptionCallerExact(ctx, run.ID, request) || laneErr != nil || (laneExists && lane != request.PreservedHead) {
+		state, _, _ := s.inspect(ctx)
+		state.Changed = changed
+		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_incomplete", "the exact clean preserved branch, one of its required history anchors, or the private mirror lane changed while the mirror was being settled; custody was not returned, both histories remain anchored, and the same fully bound action can be retried", request)
 	}
 	auth := terminalHeadAdoptionAuthorization(run, request)
 	complete := s.completeTerminalAdoption
@@ -901,8 +1034,15 @@ func (s *Service) AdoptTerminalHead(ctx context.Context, request TerminalHeadAdo
 		if !terminalHeadAdoptionAuthorizationMatches(run, request) || state.Local.Head != request.PreservedHead || !state.Local.Clean ||
 			!exactExistingCommitRef(ctx, s.workDir(), custody.RecoveryRef(run.ID), request.PreservedHead) ||
 			!exactExistingCommitRef(ctx, s.workDir(), custody.RecoveryLocalRef(run.ID), request.CallerHead) {
-			return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_replay_mismatch", "the completed terminal-head adoption no longer matches the exact authorized heads; no files, refs, or custody records were changed", request)
+			return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_replay_mismatch", fmt.Sprintf("replay requires the authorized branch clean at exactly preserved head %s with both history anchors intact; preserve any later commits and uncommitted work separately and obtain verified recovery guidance before retrying the same fully bound action from that exact clean head; no files, refs, or custody records were changed", request.PreservedHead), request)
 		}
+		// An adoption completed before the mirror lane was part of the action
+		// left the lane at the superseded caller head; replaying the same fully
+		// bound action settles it through the same guarded move.
+		if safety, message, settled := s.settleTerminalAdoptionMirror(ctx, run.ID, request); !settled {
+			return blockedTerminalHeadAdoption(state, safety, message+"; custody was already recorded by the completed adoption, but the private mirror lane was not settled", request)
+		}
+		state, _, _ = s.inspect(ctx)
 		state.Recovered = true
 		state.Changed = false
 		state.Recovery = terminalHeadAdoptionEvidence(request, "operator_authorized")
@@ -931,7 +1071,11 @@ func (s *Service) AdoptTerminalHead(ctx context.Context, request TerminalHeadAdo
 		return s.finishTerminalHeadAdoption(ctx, run, request, false)
 	}
 	if state.Local.Head != request.CallerHead {
-		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_caller_changed", "the invoking branch no longer points at the authorized caller head; no files, refs, or custody records were changed", request)
+		message := "the invoking branch no longer points at the authorized caller head; no files, refs, or custody records were changed"
+		if run.TerminalAdoptionAuthorizedAt != nil {
+			message += fmt.Sprintf("; the recorded authorization stays bound to caller head %s and preserved head %s, and the same fully bound action refuses from any other head; preserve later commits and uncommitted work separately and obtain verified recovery guidance", request.CallerHead, request.PreservedHead)
+		}
+		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_caller_changed", message, request)
 	}
 	if !state.Local.Clean {
 		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_dirty", "the invoking worktree is not clean; terminal-head adoption refuses without changing files, refs, or custody records", request)
@@ -952,6 +1096,9 @@ func (s *Service) AdoptTerminalHead(ctx context.Context, request TerminalHeadAdo
 	}
 	if compatible, err := exactCommitRefCompatible(ctx, s.workDir(), custody.RecoveryLocalRef(run.ID), request.CallerHead); err != nil || !compatible {
 		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_local_anchor_mismatch", "the submitted-head preservation ref conflicts with this authorization; no files, refs, or custody records were changed", request)
+	}
+	if _, settleable := terminalAdoptionMirrorSettleable(ctx, gateDir, run.ID, request); !settleable {
+		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_mirror_mismatch", "the private mirror lane moved away from both the authorized caller head and the preserved head, or its caller-head anchor conflicts; no files, refs, or custody records were changed", request)
 	}
 
 	authorized, err := s.DB.AuthorizeTerminalHeadAdoption(terminalHeadAdoptionAuthorization(run, request))
@@ -1092,6 +1239,13 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	state, run, _ := s.inspect(ctx)
 	if state.Safety == "blocked_branch_ambiguous" {
 		return state
+	}
+	if run != nil && run.TerminalAdoptionAuthorizedAt != nil && run.LastPushedSHA == nil && run.PRURL == nil &&
+		(run.CustodyReturnedAt == nil || s.terminalAdoptionLaneStale(ctx, run)) {
+		if keepLocal {
+			return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_keep_local", "this run already records an exact terminal-head adoption; use its fully bound replay instead of changing the authorized recovery to keep-local; no files, refs, or custody records were changed", terminalHeadAdoptionRequestFor(s.Repo, run))
+		}
+		return s.AdoptTerminalHead(ctx, terminalHeadAdoptionRequestFor(s.Repo, run))
 	}
 	// Only a live read can observe a rewritten remote, and a custody-returned
 	// run keeps a push binding a third party can still rewrite, so this check
@@ -2250,7 +2404,7 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 	if run.LastPushedSHA == nil || run.PushTargetFingerprint == nil || run.PushRef == nil || run.PushGeneration == nil || run.SubmittedHeadSHA == nil {
 		if run.SubmittedHeadSHA != nil && run.HeadSHA != ptr(run.SubmittedHeadSHA) {
 			if run.CustodyReturnedAt != nil {
-				s.classifyCustodyReturned(ctx, &state)
+				s.classifyCustodyReturned(ctx, &state, run)
 				return state, run, true
 			}
 			s.classifyPipelineOwned(ctx, &state, run, "the pipeline head has moved but has not been successfully pushed; do not make local follow-up commits yet")
@@ -2263,7 +2417,7 @@ func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {
 		// recover, and the branch and head are immediately usable.
 		if run.SubmittedHeadSHA != nil && run.LastPushedSHA == nil {
 			if run.CustodyReturnedAt != nil {
-				s.classifyCustodyReturned(ctx, &state)
+				s.classifyCustodyReturned(ctx, &state, run)
 				return state, run, true
 			}
 			if run.Status == types.RunPending || run.Status == types.RunRunning {
@@ -2600,6 +2754,21 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 	state.State = StatePipelineOwned
 	state.Pipeline.Phase = "pre_push"
 	state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, run.HeadSHA)
+	if request, eligible := s.recordedTerminalAdoptionReplay(ctx, *state, run); eligible {
+		offerTerminalAdoptionReplay(state, request)
+		return
+	}
+	if request := terminalHeadAdoptionRequestFor(s.Repo, run); terminalRunStatus(run.Status) && run.TerminalAdoptionAuthorizedAt != nil && run.CustodyReturnedAt == nil &&
+		run.LastPushedSHA == nil && run.PRURL == nil && state.Local.Head != request.CallerHead {
+		state.Safety = "blocked_recover_manual_reconciliation"
+		state.Error = fmt.Sprintf("the recorded terminal-head adoption can continue only from the branch at exactly caller head %s or preserved head %s; preserve later commits and uncommitted work separately and obtain verified recovery guidance; custody was not returned and no files or refs were changed", request.CallerHead, request.PreservedHead)
+		if state.Local.Head == request.PreservedHead {
+			state.Error = fmt.Sprintf("the branch is at authorized preserved head %s, but status cannot verify the recorded terminal-head adoption's exact interrupted state: its fully bound action continues only with the branch clean at that head or holding the exact interrupted caller snapshot of %s, with its history anchors and private mirror lane verified; if the worktree holds that caller snapshot, leave it in place and do not stash, commit, discard, or reapply it; no ordinary or keep-local recovery applies; obtain verified recovery guidance; custody was not returned and no files or refs were changed", request.PreservedHead, request.CallerHead)
+		}
+		state.Recovery = terminalHeadAdoptionEvidence(request, "operator_authorized")
+		state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
+		return
+	}
 	if terminalRunStatus(run.Status) {
 		_, _, anyMissing, allEligible := s.missingHeadKeepLocalRuns(ctx, state, run)
 		if anyMissing {
@@ -3048,14 +3217,43 @@ func RunHeadUnmoved(state State) bool {
 	return state.Pipeline.SubmittedHead != "" && state.Pipeline.CurrentHead == state.Pipeline.SubmittedHead
 }
 
+// terminalAdoptionLaneStale reports a recorded adoption whose private gate
+// lane still directly names the caller head the adoption replaced.
+func (s *Service) terminalAdoptionLaneStale(ctx context.Context, run *db.Run) bool {
+	request := terminalHeadAdoptionRequestFor(s.Repo, run)
+	if request.RepositoryID == "" {
+		return false
+	}
+	lane, exists, err := git.DirectCommitRefTarget(ctx, strings.TrimSpace(s.GateDir), "refs/heads/"+run.Branch)
+	return err == nil && exists && lane == request.CallerHead
+}
+
+// TerminalAdoptionUnsettled reports a custody-returned branch whose recorded
+// terminal-head adoption still needs its bound replay or was just refused, so
+// it must not be presented as ready for a fresh run.
+func TerminalAdoptionUnsettled(state State) bool {
+	return state.State == StateCustodyReturned &&
+		(state.Safety == "blocked_terminal_head_adoption_replay_required" || strings.HasPrefix(state.Safety, "blocked_adopt_terminal_"))
+}
+
 // classifyCustodyReturned reports a branch whose stranded terminal run was
 // explicitly recovered and never had a push binding. A diverged local head is
 // not ready to start a fresh run until the gate lane has safely adopted the
 // already-published rewrite; all other relationships remain informative only.
-func (s *Service) classifyCustodyReturned(ctx context.Context, state *State) {
+func (s *Service) classifyCustodyReturned(ctx context.Context, state *State, run *db.Run) {
 	state.State = StateCustodyReturned
 	state.Error = ""
 	state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, state.Pipeline.CurrentHead)
+	if request, eligible := s.recordedTerminalAdoptionReplay(ctx, *state, run); eligible {
+		offerTerminalAdoptionReplay(state, request)
+		return
+	}
+	if run.TerminalAdoptionAuthorizedAt != nil && s.terminalAdoptionLaneStale(ctx, run) {
+		state.Safety = "blocked_adopt_terminal_replay_mismatch"
+		state.Error = fmt.Sprintf("the recorded adoption has a stale private mirror lane, but replay requires the authorized branch clean at exactly preserved head %s with verified history anchors; status offers the bound replay only once that holds; preserve later commits and uncommitted work separately and obtain verified recovery guidance; no files or refs were changed", terminalHeadAdoptionRequestFor(s.Repo, run).PreservedHead)
+		state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
+		return
+	}
 	if state.Relation == RelationDiverged {
 		branchRef := "refs/heads/" + state.Local.Branch
 		if strings.TrimSpace(s.GateDir) != "" {

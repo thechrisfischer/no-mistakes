@@ -458,21 +458,25 @@ func TestTestStep_RepeatedCutKeepsRefusingUnvalidatedWork(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	calls := 0
+	var sctx *pipeline.StepContext
 	ag := &mockAgent{name: "test", runFn: func(ctx context.Context, _ agent.RunOpts) (*agent.Result, error) {
 		calls++
 		if calls == 1 {
 			if err := os.WriteFile(filepath.Join(dir, "fix.txt"), []byte("fixed"), 0o644); err != nil {
 				return nil, err
 			}
+			// The repair turn must finish, so it runs under a budget a slow
+			// runner cannot exhaust; every later turn is cut at 20ms.
+			sctx.Config.TestAgentTimeout = 20 * time.Millisecond
 			return &agent.Result{Output: json.RawMessage(`{"summary":"fix checkout"}`)}, nil
 		}
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx = newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Fixing = true
 	sctx.PreviousFindings = noGoTestGateJSON(headSHA)
-	sctx.Config.TestAgentTimeout = 20 * time.Millisecond
+	sctx.Config.TestAgentTimeout = time.Minute
 
 	first, err := (&TestStep{}).Execute(sctx)
 	if err != nil {

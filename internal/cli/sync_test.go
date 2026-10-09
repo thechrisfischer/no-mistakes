@@ -14,6 +14,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/branchsync"
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/gate"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
@@ -1172,6 +1173,9 @@ func TestAxiSyncCheckSurfacesRecoveryForTerminalPrePushRun(t *testing.T) {
 
 func TestAxiSyncAdoptsExactAuthorizedTerminalHeadEndToEnd(t *testing.T) {
 	f := newCLITerminalAdoptionFixture(t)
+	// A terminal run leaves its private mirror lane at the submitted head; the
+	// rewritten result is held only by the run's recovery anchor.
+	cliGit(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
 
 	status, err := executeCmd("axi", "status")
 	if err != nil {
@@ -1229,6 +1233,16 @@ func TestAxiSyncAdoptsExactAuthorizedTerminalHeadEndToEnd(t *testing.T) {
 	if got := cliGit(t, f.local, "rev-parse", "refs/no-mistakes/recover-local/"+f.runID); got != f.submitted {
 		t.Fatalf("submitted history anchor = %s, want %s", got, f.submitted)
 	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("private mirror lane = %s, want adopted head %s", got, f.preserved)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/no-mistakes/recover-local/"+f.runID); got != f.submitted {
+		t.Fatalf("gate submitted history anchor = %s, want %s", got, f.submitted)
+	}
+	// The next `axi run` prepares the private mirror exactly like this.
+	if reconciled, err := gate.ReconcileStaleBranch(context.Background(), f.gate, f.local, "feature/recover", f.preserved, ""); err != nil || reconciled.Reconciled {
+		t.Fatalf("next-run mirror preparation = %#v, err %v", reconciled, err)
+	}
 
 	p, err := paths.New()
 	if err != nil {
@@ -1251,6 +1265,19 @@ func TestAxiSyncAdoptsExactAuthorizedTerminalHeadEndToEnd(t *testing.T) {
 	replayed, err := executeCmd(args...)
 	if err != nil || !strings.Contains(replayed, "recovered: true") || !strings.Contains(replayed, "changed: false") {
 		t.Fatalf("idempotent terminal adoption replay: %v\n%s", err, replayed)
+	}
+
+	// An adoption that left the private lane at the caller head is not ready:
+	// human status reads the gate lane, and the sync check exits non-zero.
+	cliGit(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+	human, err := executeCmd("status")
+	if err != nil || !strings.Contains(human, "still needs attention") {
+		t.Fatalf("human status for a stale adoption lane: %v\n%s", err, human)
+	}
+	check, err := executeCmd("axi", "sync", "--check")
+	var checkExit *exitError
+	if err == nil || !asExitError(err, &checkExit) || checkExit.code != 1 || !strings.Contains(check, "code: adopt_terminal_head") {
+		t.Fatalf("stale adoption lane check = %v\n%s", err, check)
 	}
 }
 
@@ -1948,4 +1975,91 @@ func asExitError(err error, target **exitError) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+func TestAxiSyncTerminalBindingsRefusePartialAndWrongModesWithoutMutation(t *testing.T) {
+	f := newCLITerminalAdoptionFixture(t)
+	bindings := []string{"--repository", f.repoID, "--branch", "feature/recover", "--terminal-run", f.runID, "--caller-head", f.submitted, "--preserved-head", f.preserved}
+	tests := []struct {
+		name    string
+		args    []string
+		message string
+	}{}
+	for omitted := 0; omitted < len(bindings); omitted += 2 {
+		args := []string{"axi", "sync", "--adopt-terminal-head"}
+		args = append(args, bindings[:omitted]...)
+		args = append(args, bindings[omitted+2:]...)
+		tests = append(tests, struct {
+			name    string
+			args    []string
+			message string
+		}{bindings[omitted], args, "--adopt-terminal-head requires --repository, --branch, --terminal-run, --caller-head, and --preserved-head"})
+	}
+	tests = append(tests, struct {
+		name    string
+		args    []string
+		message string
+	}{"no bindings", []string{"axi", "sync", "--adopt-terminal-head"}, "--adopt-terminal-head requires"})
+	for _, mode := range []string{"", "--recover", "--check"} {
+		args := []string{"axi", "sync"}
+		if mode != "" {
+			args = append(args, mode)
+		}
+		args = append(args, bindings...)
+		tests = append(tests, struct {
+			name    string
+			args    []string
+			message string
+		}{"wrong mode " + mode, args, "terminal-head binding flags require --adopt-terminal-head"})
+	}
+	beforeRefs := cliGit(t, f.local, "show-ref")
+	beforeGate := cliGit(t, f.gate, "show-ref")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := executeCmd(tc.args...)
+			var exit *exitError
+			if !asExitError(err, &exit) || exit.code != 2 || !strings.Contains(out, tc.message) {
+				t.Fatalf("usage refusal: %v\n%s", err, out)
+			}
+			if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+				t.Fatalf("HEAD moved to %s", got)
+			}
+			if got := cliGit(t, f.local, "show-ref"); got != beforeRefs {
+				t.Fatal("local refs mutated")
+			}
+			if got := cliGit(t, f.gate, "show-ref"); got != beforeGate {
+				t.Fatal("gate refs mutated")
+			}
+		})
+	}
+}
+
+func TestSyncStateSuccessfulBlocksAnUnsettledTerminalAdoption(t *testing.T) {
+	for _, safety := range []string{"custody_returned", "gate_ready", "blocked_terminal_head_adoption_replay_required", "blocked_adopt_terminal_replay_mismatch", "blocked_adopt_terminal_keep_local", "blocked_adopt_terminal_mirror_mismatch"} {
+		state := branchsync.State{State: branchsync.StateCustodyReturned, Safety: safety}
+		want := safety == "custody_returned" || safety == "gate_ready"
+		for _, check := range []bool{false, true} {
+			if got := syncStateSuccessful(state, check); got != want {
+				t.Fatalf("syncStateSuccessful(%s, check=%v) = %v, want %v", safety, check, got, want)
+			}
+		}
+	}
+}
+
+func TestFreshRunRefusesAnUnsettledTerminalAdoption(t *testing.T) {
+	for _, tc := range []struct {
+		safety  string
+		blocked bool
+	}{
+		{"custody_returned", false},
+		{"gate_ready", false},
+		{"recovery_required", false},
+		{"blocked_terminal_head_adoption_replay_required", true},
+		{"blocked_adopt_terminal_replay_mismatch", true},
+	} {
+		state := branchsync.State{State: branchsync.StateCustodyReturned, Safety: tc.safety, Error: "unsettled"}
+		if got := freshRunBlockingState(state); (got != nil) != tc.blocked {
+			t.Fatalf("freshRunBlockingState(%s) = %#v, want blocked=%v", tc.safety, got, tc.blocked)
+		}
+	}
 }

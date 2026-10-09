@@ -429,6 +429,9 @@ func humanSyncSummary(state branchsync.State) string {
 		}
 		return "pipeline fix is not pushed yet; do not make local follow-up commits"
 	case branchsync.StateCustodyReturned:
+		if branchsync.TerminalAdoptionUnsettled(state) {
+			return "the recorded terminal-head adoption still needs attention; follow `no-mistakes axi status` before starting a fresh run"
+		}
 		if state.Safety == "recovery_required" && state.NextAction != nil {
 			return "a rebased local head needs guarded gate-lane adoption before it can start a fresh run"
 		}
@@ -597,7 +600,7 @@ func syncStateSuccessful(state branchsync.State, check bool) bool {
 	// A recovered branch has no pending synchronization: custody is with the
 	// operator and the next step is a fresh run, not a blocked exit code.
 	if state.State == branchsync.StateCustodyReturned {
-		return true
+		return !branchsync.TerminalAdoptionUnsettled(state)
 	}
 	// A branch released by cancellation is the operator's with nothing to
 	// synchronize or recover; it must never surface as a blocked exit.
