@@ -199,7 +199,7 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 		t.Fatalf("test job timeout-minutes = %d, want 40 so a wedged runner cannot burn a full six-hour budget", job.TimeoutMinutes)
 	}
 
-	wantWindowsShards := []string{"branchsync", "core", "daemon", "git", "steps"}
+	wantWindowsShards := []string{"branchsync", "branchsync-adopt", "core", "daemon", "git", "steps"}
 	var matrixShards []string
 	for _, row := range job.Strategy.Matrix.Include {
 		if row["os"] != "windows-latest" {
@@ -218,7 +218,7 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 
 	tests := windowsGoTestCommands(t)
 	if len(tests) != len(wantWindowsShards) {
-		t.Fatalf("Windows tests must be split across core, git, branchsync, daemon, and steps shards so one ./... job cannot exceed the cap without a binary hitting -timeout, got %d go test invocations", len(tests))
+		t.Fatalf("Windows tests must be split across core, git, branchsync, branchsync-adopt, daemon, and steps shards so one ./... job cannot exceed the cap without a binary hitting -timeout, got %d go test invocations", len(tests))
 	}
 
 	jobTimeout := time.Duration(job.TimeoutMinutes) * time.Minute
@@ -251,8 +251,8 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 	if coreCommand.name == "" {
 		t.Fatal("Windows tests must keep a go-list remainder shard")
 	}
-	if len(explicit) != 4 {
-		t.Fatalf("Windows tests must list exactly four explicit package shards (git, branchsync, daemon, and steps), got %d", len(explicit))
+	if len(explicit) != 5 {
+		t.Fatalf("Windows tests must list exactly five explicit package shards (git, branchsync, branchsync-adopt, daemon, and steps), got %d", len(explicit))
 	}
 	for _, shard := range wantWindowsShards {
 		if _, ok := stepShards[shard]; !ok {
@@ -268,8 +268,33 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 	stepsWant := goListPackages(t, "./internal/pipeline/steps/...")
 	var stepsCommand workflowCommand
 	var stepsFromArgs, gitFromArgs []string
+	testFilters := map[string]string{}
 	for _, command := range explicit {
 		pkgs := goListPackages(t, goTestPackagePatterns(command)...)
+		shard := matrixShardCondition(job.Steps[command.step].If)
+		run, skip := goTestFlag(command, "-run"), goTestFlag(command, "-skip")
+		switch shard {
+		case "branchsync":
+			if run != "" || skip == "" {
+				t.Fatalf("branchsync shard must only -skip the adoption tests, got -run=%q -skip=%q", run, skip)
+			}
+			testFilters["skip"] = skip
+		case "branchsync-adopt":
+			if skip != "" || run == "" {
+				t.Fatalf("branchsync-adopt shard must only -run the adoption tests, got -run=%q -skip=%q", run, skip)
+			}
+			testFilters["run"] = run
+			if want := goListPackages(t, "./internal/branchsync"); !slices.Equal(pkgs, want) {
+				t.Fatalf("branchsync-adopt shard must run only internal/branchsync, got %v", pkgs)
+			}
+			// The branchsync shard counts the package once; together the
+			// complementary filters run each of its tests exactly once.
+			continue
+		default:
+			if run != "" || skip != "" {
+				t.Fatalf("Windows shard %q filters tests (-run=%q -skip=%q); only the branchsync split may", shard, run, skip)
+			}
+		}
 		if slices.Equal(pkgs, stepsWant) {
 			if stepsCommand.name != "" {
 				t.Fatal("multiple Windows shards list only pipeline/steps packages")
@@ -278,7 +303,6 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 			stepsFromArgs = pkgs
 			continue
 		}
-		shard := matrixShardCondition(job.Steps[command.step].If)
 		if shard == "branchsync" || shard == "daemon" {
 			want := goListPackages(t, "./internal/"+shard)
 			if !slices.Equal(pkgs, want) {
@@ -289,6 +313,9 @@ func TestCIWorkflow_WindowsHangSurfacesAsGoTimeoutNotJobCancellation(t *testing.
 	}
 	if stepsCommand.name == "" {
 		t.Fatal("Windows tests must run ./internal/pipeline/steps/... on its own shard")
+	}
+	if testFilters["run"] != testFilters["skip"] {
+		t.Fatalf("branchsync shards must split on one pattern so every test runs exactly once: -run=%q vs -skip=%q", testFilters["run"], testFilters["skip"])
 	}
 	if len(gitFromArgs) == 0 {
 		t.Fatal("Windows tests must keep a git-heavy remainder shard besides pipeline/steps")
@@ -397,6 +424,18 @@ func matrixShardCondition(ifCond string) string {
 		return ""
 	}
 	return quotedShard[1 : len(quotedShard)-1]
+}
+
+func goTestFlag(command workflowCommand, name string) string {
+	for i, arg := range command.args[1:] {
+		switch {
+		case strings.HasPrefix(arg, name+"="):
+			return strings.TrimPrefix(arg, name+"=")
+		case arg == name && i+2 < len(command.args):
+			return command.args[i+2]
+		}
+	}
+	return ""
 }
 
 func goTestTimeout(t *testing.T, command workflowCommand) time.Duration {

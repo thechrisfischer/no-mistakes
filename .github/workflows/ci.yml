@@ -53,6 +53,9 @@ jobs:
             name: test (windows-branchsync)
             shard: branchsync
           - os: windows-latest
+            name: test (windows-branchsync-adopt)
+            shard: branchsync-adopt
+          - os: windows-latest
             name: test (windows-daemon)
             shard: daemon
           - os: windows-latest
@@ -67,7 +70,9 @@ jobs:
     # evidence-free cancellation. Git-heavy packages are split from the core
     # remainder, and pipeline/steps is its own shard so it no longer serializes
     # behind the other git-heavy packages on a 4-core GitHub-hosted runner.
-    # Branchsync and daemon each own a runner to bound the serial package wall.
+    # Branchsync and daemon each own a runner to bound the serial package wall;
+    # branchsync alone outgrew one runner, so its TestAdopt* tests run on a
+    # second one (complementary -run/-skip on the same pattern).
     # 40 is a runaway guard, not a target - Linux and macOS finish far inside
     # it, and it still keeps a wedged runner well short of the six-hour default.
     timeout-minutes: 40
@@ -120,7 +125,11 @@ jobs:
 
       - name: Test on Windows (branchsync)
         if: runner.os == 'Windows' && matrix.shard == 'branchsync'
-        run: go test -v -timeout=20m ./internal/branchsync
+        run: go test -v -timeout=20m -skip=^TestAdopt ./internal/branchsync
+
+      - name: Test on Windows (branchsync adoption)
+        if: runner.os == 'Windows' && matrix.shard == 'branchsync-adopt'
+        run: go test -v -timeout=20m -run=^TestAdopt ./internal/branchsync
 
       - name: Test on Windows (daemon)
         if: runner.os == 'Windows' && matrix.shard == 'daemon'
