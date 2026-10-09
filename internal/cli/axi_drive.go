@@ -733,6 +733,11 @@ func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.
 		return &state
 	case branchsync.StatePushInProgress:
 		return &state
+	case branchsync.StateCustodyReturned:
+		if branchsync.TerminalAdoptionUnsettled(state) {
+			return &state
+		}
+		return nil
 	default:
 		return nil
 	}

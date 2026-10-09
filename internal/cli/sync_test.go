@@ -2020,3 +2020,15 @@ func TestAxiSyncTerminalBindingsRefusePartialAndWrongModesWithoutMutation(t *tes
 		})
 	}
 }
+
+func TestSyncStateSuccessfulBlocksAnUnsettledTerminalAdoption(t *testing.T) {
+	for _, safety := range []string{"custody_returned", "gate_ready", "blocked_terminal_head_adoption_replay_required", "blocked_adopt_terminal_replay_mismatch"} {
+		state := branchsync.State{State: branchsync.StateCustodyReturned, Safety: safety}
+		want := safety == "custody_returned" || safety == "gate_ready"
+		for _, check := range []bool{false, true} {
+			if got := syncStateSuccessful(state, check); got != want {
+				t.Fatalf("syncStateSuccessful(%s, check=%v) = %v, want %v", safety, check, got, want)
+			}
+		}
+	}
+}

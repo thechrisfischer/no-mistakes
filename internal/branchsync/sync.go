@@ -779,6 +779,9 @@ func (s *Service) settleTerminalAdoptionMirror(ctx context.Context, runID string
 	if lane == "" || lane == request.PreservedHead {
 		return "", "", true
 	}
+	if !exactExistingCommitRef(ctx, gateDir, custody.RecoveryRef(runID), request.PreservedHead) {
+		return "blocked_adopt_terminal_mirror_mismatch", "the run-specific preserved-head anchor no longer matches the authorized preserved head; the private mirror lane was not moved", false
+	}
 	if err := custody.PreserveRecoveryAnchor(ctx, gateDir, gateAnchor, request.CallerHead); err != nil || !exactExistingCommitRef(ctx, gateDir, gateAnchor, request.CallerHead) {
 		return "blocked_adopt_terminal_mirror_preserve_failed", fmt.Sprintf("the superseded caller head could not be anchored at %s in the local gate; the private mirror lane was not moved", gateAnchor), false
 	}
@@ -1039,6 +1042,7 @@ func (s *Service) AdoptTerminalHead(ctx context.Context, request TerminalHeadAdo
 		if safety, message, settled := s.settleTerminalAdoptionMirror(ctx, run.ID, request); !settled {
 			return blockedTerminalHeadAdoption(state, safety, message+"; custody was already recorded by the completed adoption, but the private mirror lane was not settled", request)
 		}
+		state, _, _ = s.inspect(ctx)
 		state.Recovered = true
 		state.Changed = false
 		state.Recovery = terminalHeadAdoptionEvidence(request, "operator_authorized")
@@ -3207,6 +3211,14 @@ func (s *Service) terminalAdoptionLaneStale(ctx context.Context, run *db.Run) bo
 	}
 	lane, exists, err := git.DirectCommitRefTarget(ctx, strings.TrimSpace(s.GateDir), "refs/heads/"+run.Branch)
 	return err == nil && exists && lane == request.CallerHead
+}
+
+// TerminalAdoptionUnsettled reports a custody-returned branch whose recorded
+// terminal-head adoption still leaves the private mirror lane at the
+// superseded caller head, so a fresh run must not start yet.
+func TerminalAdoptionUnsettled(state State) bool {
+	return state.State == StateCustodyReturned &&
+		(state.Safety == "blocked_terminal_head_adoption_replay_required" || state.Safety == "blocked_adopt_terminal_replay_mismatch")
 }
 
 // classifyCustodyReturned reports a branch whose stranded terminal run was

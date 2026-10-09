@@ -133,9 +133,15 @@ func TestAdoptTerminalHeadReplaySettlesMirrorLeftByEarlierAdoption(t *testing.T)
 		t.Fatalf("refused preparation moved the lane to %s", got)
 	}
 
+	if status := f.service.InspectCached(f.ctx); !TerminalAdoptionUnsettled(status) || status.NextAction == nil || status.NextAction.Code != "adopt_terminal_head" {
+		t.Fatalf("stale-lane status before replay = %#v", status)
+	}
 	replay := f.service.AdoptTerminalHead(f.ctx, request)
 	if !replay.Recovered || replay.Changed {
 		t.Fatalf("replay settling the mirror = %#v", replay)
+	}
+	if TerminalAdoptionUnsettled(replay) || replay.Error != "" || replay.NextAction == nil || replay.NextAction.Code != "run_pipeline" {
+		t.Fatalf("successful replay still reports the superseded replay offer: %#v", replay)
 	}
 	if got := f.mirrorLane(); got != f.preserved {
 		t.Fatalf("replay left the mirror lane at %s", got)
@@ -716,6 +722,9 @@ func TestAdoptTerminalHeadCompletedStatusOffersOnlyExactStaleLaneReplay(t *testi
 			if offered != (shape == "exact") {
 				t.Fatalf("%s replay offer = %#v", shape, status)
 			}
+			if TerminalAdoptionUnsettled(status) != (shape != "lane moved") {
+				t.Fatalf("%s unsettled classification = %#v", shape, status)
+			}
 			if shape == "exact" {
 				if status.NextAction.Command != terminalHeadAdoptionCommand(request) {
 					t.Fatal("bindings changed")
@@ -782,6 +791,33 @@ func TestRecoverAfterSettledAdoptionStaysAnIdempotentNoop(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// TestAdoptTerminalHeadReplayWritesNoGateAnchorOnMissingPreservedEvidence
+// keeps the completed-adoption replay fail-closed without Git mutation: a
+// missing gate preserved-head anchor refuses before the caller-head anchor is
+// written or the lane moves.
+func TestAdoptTerminalHeadReplayWritesNoGateAnchorOnMissingPreservedEvidence(t *testing.T) {
+	t.Parallel()
+	f := newStaleMirrorAdoptionFixture(t)
+	request := terminalHeadAdoptionRequest(f)
+	if result := f.service.AdoptTerminalHead(f.ctx, request); !result.Recovered {
+		t.Fatalf("adoption = %#v", result)
+	}
+	mustRun(t, f.gate, "update-ref", "refs/heads/"+f.run.Branch, f.submitted, f.preserved)
+	mustRun(t, f.gate, "update-ref", "-d", f.localAnchorRef(), f.submitted)
+	mustRun(t, f.gate, "update-ref", "-d", f.anchorRef(), f.preserved)
+
+	result := f.service.AdoptTerminalHead(f.ctx, request)
+	if result.Recovered || result.Safety != "blocked_adopt_terminal_mirror_mismatch" {
+		t.Fatalf("replay with missing gate preserved evidence = %#v", result)
+	}
+	if got := readGitOptional(t, f.gate, f.localAnchorRef()); got != "" {
+		t.Fatalf("refused replay wrote gate caller anchor at %s", got)
+	}
+	if got := f.mirrorLane(); got != f.submitted {
+		t.Fatalf("refused replay moved the lane to %s", got)
 	}
 }
 

@@ -63,7 +63,14 @@ func renderLocalBranchStatus(state *branchsync.State, refreshing bool, width int
 		case branchsync.StateTargetChanged:
 			message = "The configured push target changed after the pipeline push. Synchronization is blocked."
 		case branchsync.StateCustodyReturned:
-			message = "Custody returned; the branch is yours. Start a fresh run when ready."
+			if recoverableBranchSync(state) {
+				message = "The recorded terminal-head adoption must settle the private mirror before a fresh run."
+				footer = "u recover custody"
+			} else if branchsync.TerminalAdoptionUnsettled(*state) {
+				message = "The recorded terminal-head adoption has not settled the private mirror. Inspect `no-mistakes axi status` before starting a fresh run."
+			} else {
+				message = "Custody returned; the branch is yours. Start a fresh run when ready."
+			}
 		case branchsync.StateUserOwned:
 			message = "Run ended before the pipeline changed anything; the branch and head are yours and immediately usable."
 		default:
@@ -109,6 +116,9 @@ func boundedTUISyncValue(value string) string {
 // recoverableBranchSync reports whether the state is the stranded terminal
 // pipeline_owned custody state that the guarded recovery action can end.
 func recoverableBranchSync(state *branchsync.State) bool {
+	if state != nil && state.Safety == "blocked_terminal_head_adoption_replay_required" {
+		return true
+	}
 	return state != nil && state.State == branchsync.StatePipelineOwned && state.Safety == "blocked_pipeline_owned_recoverable"
 }
 
