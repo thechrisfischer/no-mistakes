@@ -718,7 +718,10 @@ func inspectAxiBranchSync(ctx context.Context, env *axiEnv) branchsync.State {
 }
 
 func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.State {
-	state := inspectAxiBranchSync(ctx, env)
+	return freshRunBlockingState(inspectAxiBranchSync(ctx, env))
+}
+
+func freshRunBlockingState(state branchsync.State) *branchsync.State {
 	switch state.State {
 	case branchsync.StatePipelineOwned:
 		// The ownership block exists to keep a fresh push from discarding

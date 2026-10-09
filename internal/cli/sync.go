@@ -430,7 +430,7 @@ func humanSyncSummary(state branchsync.State) string {
 		return "pipeline fix is not pushed yet; do not make local follow-up commits"
 	case branchsync.StateCustodyReturned:
 		if branchsync.TerminalAdoptionUnsettled(state) {
-			return "the recorded terminal-head adoption has not settled the private mirror; follow `no-mistakes axi status` before starting a fresh run"
+			return "the recorded terminal-head adoption still needs attention; follow `no-mistakes axi status` before starting a fresh run"
 		}
 		if state.Safety == "recovery_required" && state.NextAction != nil {
 			return "a rebased local head needs guarded gate-lane adoption before it can start a fresh run"

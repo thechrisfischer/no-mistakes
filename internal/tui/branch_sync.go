@@ -67,7 +67,7 @@ func renderLocalBranchStatus(state *branchsync.State, refreshing bool, width int
 				message = "The recorded terminal-head adoption must settle the private mirror before a fresh run."
 				footer = "u recover custody"
 			} else if branchsync.TerminalAdoptionUnsettled(*state) {
-				message = "The recorded terminal-head adoption has not settled the private mirror. Inspect `no-mistakes axi status` before starting a fresh run."
+				message = "The recorded terminal-head adoption still needs attention. Inspect `no-mistakes axi status` before starting a fresh run."
 			} else {
 				message = "Custody returned; the branch is yours. Start a fresh run when ready."
 			}
@@ -114,7 +114,8 @@ func boundedTUISyncValue(value string) string {
 }
 
 // recoverableBranchSync reports whether the state is the stranded terminal
-// pipeline_owned custody state that the guarded recovery action can end.
+// pipeline_owned custody state, or an offered terminal-head adoption replay,
+// that the guarded recovery action can end.
 func recoverableBranchSync(state *branchsync.State) bool {
 	if state != nil && state.Safety == "blocked_terminal_head_adoption_replay_required" {
 		return true
@@ -131,6 +132,15 @@ func renderRecoverConfirmation(state branchsync.State, width int) string {
 		width = 80
 	}
 	var b strings.Builder
+	if state.Recovery != nil && state.Recovery.Source == "terminal_head_adoption" {
+		b.WriteString("Recovery replays the recorded, operator-authorized terminal-head adoption\n")
+		b.WriteString("through its fully bound action and settles the private mirror lane.\n\n")
+		fmt.Fprintf(&b, "Local branch:   %s\n", state.Local.Branch)
+		fmt.Fprintf(&b, "Caller HEAD:    %s\n", state.Recovery.RequiredHead)
+		fmt.Fprintf(&b, "Preserved HEAD: %s\n\n", state.Recovery.PreservedHead)
+		b.WriteString("Any changed head, anchor, lane, or binding refuses without changes; keep-local is not available for a recorded adoption.")
+		return renderBoxWithFooter("Confirm terminal-head adoption replay", b.String(), width, "u/enter recover  ·  esc cancel")
+	}
 	fmt.Fprintf(&b, "The run ended %s without publishing its pipeline commits.\n", state.Pipeline.Status)
 	if archiveKeepLocalRecovery(&state) {
 		fmt.Fprintf(&b, "A verified archive preserves the divergent later head. Recovery keeps the\n")

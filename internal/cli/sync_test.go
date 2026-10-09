@@ -1266,6 +1266,19 @@ func TestAxiSyncAdoptsExactAuthorizedTerminalHeadEndToEnd(t *testing.T) {
 	if err != nil || !strings.Contains(replayed, "recovered: true") || !strings.Contains(replayed, "changed: false") {
 		t.Fatalf("idempotent terminal adoption replay: %v\n%s", err, replayed)
 	}
+
+	// An adoption that left the private lane at the caller head is not ready:
+	// human status reads the gate lane, and the sync check exits non-zero.
+	cliGit(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+	human, err := executeCmd("status")
+	if err != nil || !strings.Contains(human, "still needs attention") {
+		t.Fatalf("human status for a stale adoption lane: %v\n%s", err, human)
+	}
+	check, err := executeCmd("axi", "sync", "--check")
+	var checkExit *exitError
+	if err == nil || !asExitError(err, &checkExit) || checkExit.code != 1 || !strings.Contains(check, "code: adopt_terminal_head") {
+		t.Fatalf("stale adoption lane check = %v\n%s", err, check)
+	}
 }
 
 // TestAxiSyncRecoversRemoteRewrittenBindingEndToEnd reproduces issue #652:
@@ -2022,13 +2035,31 @@ func TestAxiSyncTerminalBindingsRefusePartialAndWrongModesWithoutMutation(t *tes
 }
 
 func TestSyncStateSuccessfulBlocksAnUnsettledTerminalAdoption(t *testing.T) {
-	for _, safety := range []string{"custody_returned", "gate_ready", "blocked_terminal_head_adoption_replay_required", "blocked_adopt_terminal_replay_mismatch"} {
+	for _, safety := range []string{"custody_returned", "gate_ready", "blocked_terminal_head_adoption_replay_required", "blocked_adopt_terminal_replay_mismatch", "blocked_adopt_terminal_keep_local", "blocked_adopt_terminal_mirror_mismatch"} {
 		state := branchsync.State{State: branchsync.StateCustodyReturned, Safety: safety}
 		want := safety == "custody_returned" || safety == "gate_ready"
 		for _, check := range []bool{false, true} {
 			if got := syncStateSuccessful(state, check); got != want {
 				t.Fatalf("syncStateSuccessful(%s, check=%v) = %v, want %v", safety, check, got, want)
 			}
+		}
+	}
+}
+
+func TestFreshRunRefusesAnUnsettledTerminalAdoption(t *testing.T) {
+	for _, tc := range []struct {
+		safety  string
+		blocked bool
+	}{
+		{"custody_returned", false},
+		{"gate_ready", false},
+		{"recovery_required", false},
+		{"blocked_terminal_head_adoption_replay_required", true},
+		{"blocked_adopt_terminal_replay_mismatch", true},
+	} {
+		state := branchsync.State{State: branchsync.StateCustodyReturned, Safety: tc.safety, Error: "unsettled"}
+		if got := freshRunBlockingState(state); (got != nil) != tc.blocked {
+			t.Fatalf("freshRunBlockingState(%s) = %#v, want blocked=%v", tc.safety, got, tc.blocked)
 		}
 	}
 }

@@ -1034,7 +1034,7 @@ func (s *Service) AdoptTerminalHead(ctx context.Context, request TerminalHeadAdo
 		if !terminalHeadAdoptionAuthorizationMatches(run, request) || state.Local.Head != request.PreservedHead || !state.Local.Clean ||
 			!exactExistingCommitRef(ctx, s.workDir(), custody.RecoveryRef(run.ID), request.PreservedHead) ||
 			!exactExistingCommitRef(ctx, s.workDir(), custody.RecoveryLocalRef(run.ID), request.CallerHead) {
-			return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_replay_mismatch", "replay requires the authorized branch clean at the exact preserved head with both history anchors intact; preserve any later commits and uncommitted work separately, then obtain verified recovery guidance before retrying; no files, refs, or custody records were changed", request)
+			return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_replay_mismatch", fmt.Sprintf("replay requires the authorized branch clean at exactly preserved head %s with both history anchors intact; preserve any later commits and uncommitted work separately and obtain verified recovery guidance before retrying the same fully bound action from that exact clean head; no files, refs, or custody records were changed", request.PreservedHead), request)
 		}
 		// An adoption completed before the mirror lane was part of the action
 		// left the lane at the superseded caller head; replaying the same fully
@@ -1071,7 +1071,11 @@ func (s *Service) AdoptTerminalHead(ctx context.Context, request TerminalHeadAdo
 		return s.finishTerminalHeadAdoption(ctx, run, request, false)
 	}
 	if state.Local.Head != request.CallerHead {
-		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_caller_changed", "the invoking branch no longer points at the authorized caller head; no files, refs, or custody records were changed", request)
+		message := "the invoking branch no longer points at the authorized caller head; no files, refs, or custody records were changed"
+		if run.TerminalAdoptionAuthorizedAt != nil {
+			message += fmt.Sprintf("; the recorded authorization stays bound to caller head %s and preserved head %s, and the same fully bound action refuses from any other head; preserve later commits and uncommitted work separately and obtain verified recovery guidance", request.CallerHead, request.PreservedHead)
+		}
+		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_caller_changed", message, request)
 	}
 	if !state.Local.Clean {
 		return blockedTerminalHeadAdoption(state, "blocked_adopt_terminal_dirty", "the invoking worktree is not clean; terminal-head adoption refuses without changing files, refs, or custody records", request)
@@ -2754,6 +2758,14 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 		offerTerminalAdoptionReplay(state, request)
 		return
 	}
+	if request := terminalHeadAdoptionRequestFor(s.Repo, run); terminalRunStatus(run.Status) && run.TerminalAdoptionAuthorizedAt != nil && run.CustodyReturnedAt == nil &&
+		run.LastPushedSHA == nil && run.PRURL == nil && state.Local.Head != request.CallerHead && state.Local.Head != request.PreservedHead {
+		state.Safety = "blocked_recover_manual_reconciliation"
+		state.Error = fmt.Sprintf("the recorded terminal-head adoption can continue only from the branch at exactly caller head %s or preserved head %s; preserve later commits and uncommitted work separately and obtain verified recovery guidance; custody was not returned and no files or refs were changed", request.CallerHead, request.PreservedHead)
+		state.Recovery = terminalHeadAdoptionEvidence(request, "operator_authorized")
+		state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
+		return
+	}
 	if terminalRunStatus(run.Status) {
 		_, _, anyMissing, allEligible := s.missingHeadKeepLocalRuns(ctx, state, run)
 		if anyMissing {
@@ -3214,11 +3226,11 @@ func (s *Service) terminalAdoptionLaneStale(ctx context.Context, run *db.Run) bo
 }
 
 // TerminalAdoptionUnsettled reports a custody-returned branch whose recorded
-// terminal-head adoption still leaves the private mirror lane at the
-// superseded caller head, so a fresh run must not start yet.
+// terminal-head adoption still needs its bound replay or was just refused, so
+// it must not be presented as ready for a fresh run.
 func TerminalAdoptionUnsettled(state State) bool {
 	return state.State == StateCustodyReturned &&
-		(state.Safety == "blocked_terminal_head_adoption_replay_required" || state.Safety == "blocked_adopt_terminal_replay_mismatch")
+		(state.Safety == "blocked_terminal_head_adoption_replay_required" || strings.HasPrefix(state.Safety, "blocked_adopt_terminal_"))
 }
 
 // classifyCustodyReturned reports a branch whose stranded terminal run was
@@ -3235,7 +3247,7 @@ func (s *Service) classifyCustodyReturned(ctx context.Context, state *State, run
 	}
 	if run.TerminalAdoptionAuthorizedAt != nil && s.terminalAdoptionLaneStale(ctx, run) {
 		state.Safety = "blocked_adopt_terminal_replay_mismatch"
-		state.Error = "the recorded adoption has a stale private mirror lane, but replay requires the authorized branch clean at the exact preserved head and verified history anchors; preserve later commits and uncommitted work separately and obtain verified recovery guidance; no files or refs were changed"
+		state.Error = fmt.Sprintf("the recorded adoption has a stale private mirror lane, but replay requires the authorized branch clean at exactly preserved head %s with verified history anchors; status offers the bound replay only once that holds; preserve later commits and uncommitted work separately and obtain verified recovery guidance; no files or refs were changed", terminalHeadAdoptionRequestFor(s.Repo, run).PreservedHead)
 		state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
 		return
 	}

@@ -97,6 +97,9 @@ func TestAdoptTerminalHeadSettlesPrivateMirrorForTheNextRun(t *testing.T) {
 	if got := f.mirrorLane(); got != f.preserved {
 		t.Fatalf("mirror lane = %s, want adopted head %s", got, f.preserved)
 	}
+	if status := f.service.InspectCached(f.ctx); status.State != StateCustodyReturned || status.Safety != "custody_returned" || status.NextAction == nil || status.NextAction.Code != "run_pipeline" {
+		t.Fatalf("status after a settled adoption = %#v", status)
+	}
 	if replay := f.service.AdoptTerminalHead(f.ctx, terminalHeadAdoptionRequest(f)); !replay.Recovered || replay.Changed {
 		t.Fatalf("idempotent replay = %#v", replay)
 	}
@@ -205,6 +208,9 @@ func TestAdoptTerminalHeadMirrorLaneShapes(t *testing.T) {
 		}
 		if got := f.mirrorLane(); got != "" {
 			t.Fatalf("adoption created an absent lane at %s", got)
+		}
+		if status := f.service.InspectCached(f.ctx); status.Safety != "custody_returned" || status.NextAction == nil || status.NextAction.Code != "run_pipeline" {
+			t.Fatalf("status after an absent-lane adoption = %#v", status)
 		}
 		reconciled, err := gate.ReconcileStaleBranch(f.ctx, f.gate, f.local, f.run.Branch, f.preserved, "")
 		if err != nil || reconciled.Reconciled {
@@ -674,10 +680,12 @@ func TestAdoptTerminalHeadInterruptedStatusRoutesBoundReplay(t *testing.T) {
 			}()
 			f.service.afterTerminalAdoptionMirrorAnchor = nil
 			status := f.service.InspectCached(f.ctx)
-			if status.NextAction == nil || status.NextAction.Code != "adopt_terminal_head" || status.NextAction.Command != terminalHeadAdoptionCommand(request) || f.custodyReturned() {
+			if status.NextAction == nil || status.NextAction.Code != "adopt_terminal_head" || status.NextAction.Command != terminalHeadAdoptionCommand(request) || f.custodyReturned() ||
+				status.Safety != "blocked_terminal_head_adoption_replay_required" || status.Recovery == nil || status.Recovery.Proof != "operator_authorized" {
 				t.Fatalf("interrupted recovery offer = %#v", status)
 			}
-			if kept := f.service.Recover(f.ctx, true); kept.Recovered || kept.Safety != "blocked_adopt_terminal_keep_local" || f.custodyReturned() || f.mirrorLane() != f.submitted {
+			if kept := f.service.Recover(f.ctx, true); kept.Recovered || kept.Safety != "blocked_adopt_terminal_keep_local" || f.custodyReturned() || f.mirrorLane() != f.submitted ||
+				kept.NextAction == nil || kept.NextAction.Code != "adopt_terminal_head" || kept.NextAction.Command != terminalHeadAdoptionCommand(request) || kept.Recovery == nil || kept.Recovery.Proof != "operator_authorized" {
 				t.Fatalf("keep-local changed the recorded adoption: %#v", kept)
 			}
 			var result State
@@ -725,6 +733,10 @@ func TestAdoptTerminalHeadCompletedStatusOffersOnlyExactStaleLaneReplay(t *testi
 			if TerminalAdoptionUnsettled(status) != (shape != "lane moved") {
 				t.Fatalf("%s unsettled classification = %#v", shape, status)
 			}
+			if shape != "exact" && shape != "lane moved" && (status.Safety != "blocked_adopt_terminal_replay_mismatch" ||
+				status.NextAction == nil || status.NextAction.Code != "inspect_and_reconcile_manually" || !strings.Contains(status.Error, f.preserved)) {
+				t.Fatalf("%s stale-lane mismatch = %#v", shape, status)
+			}
 			if shape == "exact" {
 				if status.NextAction.Command != terminalHeadAdoptionCommand(request) {
 					t.Fatal("bindings changed")
@@ -771,8 +783,12 @@ func TestRecoverAfterSettledAdoptionStaysAnIdempotentNoop(t *testing.T) {
 
 					result := f.service.Recover(f.ctx, keepLocal)
 					if lane == "stale" {
-						if result.Recovered || !strings.HasPrefix(result.Safety, "blocked_adopt_terminal_") {
-							t.Fatalf("stale lane recovery reported readiness: %#v", result)
+						want := "blocked_adopt_terminal_replay_mismatch"
+						if keepLocal {
+							want = "blocked_adopt_terminal_keep_local"
+						}
+						if result.Recovered || result.Safety != want || !f.custodyReturned() || !TerminalAdoptionUnsettled(result) {
+							t.Fatalf("stale lane recovery = %#v, want refusal %s with custody kept", result, want)
 						}
 					} else if !result.Recovered || result.Changed {
 						t.Fatalf("settled adoption recovery = %#v", result)
@@ -818,6 +834,72 @@ func TestAdoptTerminalHeadReplayWritesNoGateAnchorOnMissingPreservedEvidence(t *
 	}
 	if got := f.mirrorLane(); got != f.submitted {
 		t.Fatalf("refused replay moved the lane to %s", got)
+	}
+}
+
+// TestAdoptTerminalHeadAuthorizedCallerChangeNamesTheBoundHeads keeps the
+// refusal for an authorized adoption whose caller later committed nondestructive
+// and honest: nothing moves, custody is not returned, and the diagnostic names
+// the exact heads the recorded authorization can still continue from.
+func TestAdoptTerminalHeadAuthorizedCallerChangeNamesTheBoundHeads(t *testing.T) {
+	t.Parallel()
+	f := newStaleMirrorAdoptionFixture(t)
+	request := terminalHeadAdoptionRequest(f)
+	f.service.afterTerminalAdoptionAuthorized = func() { panic("interrupted after authorization") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected interruption")
+			}
+		}()
+		f.service.AdoptTerminalHead(f.ctx, request)
+	}()
+	f.service.afterTerminalAdoptionAuthorized = nil
+	mustRun(t, f.local, "commit", "--allow-empty", "-m", "later work")
+	later := mustRun(t, f.local, "rev-parse", "HEAD")
+
+	for _, result := range []State{f.service.AdoptTerminalHead(f.ctx, request), f.service.Recover(f.ctx, false)} {
+		if result.Recovered || result.Safety != "blocked_adopt_terminal_caller_changed" || f.custodyReturned() ||
+			!strings.Contains(result.Error, f.submitted) || !strings.Contains(result.Error, f.preserved) {
+			t.Fatalf("authorized caller change = %#v", result)
+		}
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != later {
+		t.Fatalf("refusal moved HEAD to %s", got)
+	}
+	if got := f.mirrorLane(); got != f.submitted {
+		t.Fatalf("refusal moved the lane to %s", got)
+	}
+}
+
+// TestAdoptTerminalHeadInterruptedThenCommittedAdvertisesNoRefusingAction
+// keeps status honest after an authorized adoption was interrupted past its
+// branch move and the operator then committed: the only executable continuation
+// is from an exact bound head, so status advertises manual reconciliation
+// naming both heads instead of an ordinary recovery Recover would refuse.
+func TestAdoptTerminalHeadInterruptedThenCommittedAdvertisesNoRefusingAction(t *testing.T) {
+	t.Parallel()
+	f := newStaleMirrorAdoptionFixture(t)
+	request := terminalHeadAdoptionRequest(f)
+	f.service.afterTerminalAdoptionMirrorAnchor = func() { panic("interrupted settlement") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected interruption")
+			}
+		}()
+		f.service.AdoptTerminalHead(f.ctx, request)
+	}()
+	f.service.afterTerminalAdoptionMirrorAnchor = nil
+	mustRun(t, f.local, "commit", "--allow-empty", "-m", "later work")
+
+	status := f.service.InspectCached(f.ctx)
+	if status.State != StatePipelineOwned || status.Safety != "blocked_recover_manual_reconciliation" || status.NextAction == nil || status.NextAction.Code != "inspect_and_reconcile_manually" ||
+		!strings.Contains(status.Error, f.submitted) || !strings.Contains(status.Error, f.preserved) {
+		t.Fatalf("status for an interrupted adoption with later work = %#v", status)
+	}
+	if result := f.service.Recover(f.ctx, false); result.Recovered || result.Safety != "blocked_adopt_terminal_caller_changed" || f.custodyReturned() {
+		t.Fatalf("recover after later work = %#v", result)
 	}
 }
 

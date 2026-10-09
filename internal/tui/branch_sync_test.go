@@ -329,3 +329,73 @@ func TestActivePipelineOwnedStateOffersNoRecoveryAction(t *testing.T) {
 		t.Fatalf("u acted on an active pipeline_owned state: %#v", m)
 	}
 }
+
+// TestTerminalAdoptionReplayKeepsTheTUIRecoverAction covers the bound
+// terminal-head adoption replay in the TUI: an offered replay (pipeline_owned
+// or custody_returned) keeps `u` routed to ordinary Recover, never keep-local,
+// while a stale lane the replay cannot settle offers no recovery action.
+func TestTerminalAdoptionReplayKeepsTheTUIRecoverAction(t *testing.T) {
+	for _, tc := range []struct {
+		state    string
+		safety   string
+		offered  bool
+		contains string
+	}{
+		{branchsync.StatePipelineOwned, "blocked_terminal_head_adoption_replay_required", true, "u recover custody"},
+		{branchsync.StateCustodyReturned, "blocked_terminal_head_adoption_replay_required", true, "u recover custody"},
+		{branchsync.StateCustodyReturned, "blocked_adopt_terminal_replay_mismatch", false, "still needs attention"},
+	} {
+		t.Run(tc.state+"/"+tc.safety, func(t *testing.T) {
+			run := &ipc.RunInfo{ID: "run-1", Branch: "feature", Status: types.RunCancelled}
+			m := NewModel("socket", nil, run)
+			state := branchsync.State{
+				State: tc.state, Safety: tc.safety,
+				Local:    branchsync.LocalState{Branch: "feature", Head: strings.Repeat("c", 40), Clean: true},
+				Pipeline: branchsync.PipelineState{RunID: "run-1", Status: "cancelled", CurrentHead: strings.Repeat("c", 40)},
+				Recovery: &branchsync.RecoveryEvidence{Source: "terminal_head_adoption", Proof: "operator_authorized", RequiredHead: strings.Repeat("a", 40), PreservedHead: strings.Repeat("c", 40)},
+			}
+			m.branchSync = &state
+			view := stripANSI(renderLocalBranchStatus(m.branchSync, false, 80))
+			if !strings.Contains(view, tc.contains) {
+				t.Fatalf("status missing %q:\n%s", tc.contains, view)
+			}
+			if !tc.offered && strings.Contains(view, "u recover custody") {
+				t.Fatalf("unsettleable lane offered recovery:\n%s", view)
+			}
+			calls := 0
+			m.syncRecover = func(keepLocal bool) branchsync.State {
+				if keepLocal {
+					t.Fatal("bound adoption replay selected keep-local")
+				}
+				calls++
+				return state
+			}
+			nextModel, _ := m.handleKey(keyMsg("u"))
+			m = nextModel.(Model)
+			if m.recoverConfirm != tc.offered {
+				t.Fatalf("recover confirmation = %v, want %v", m.recoverConfirm, tc.offered)
+			}
+			if !tc.offered {
+				return
+			}
+			confirm := stripANSI(m.View())
+			for _, want := range []string{"operator-authorized terminal-head adoption", strings.Repeat("a", 40), strings.Repeat("c", 40)} {
+				if !strings.Contains(confirm, want) {
+					t.Fatalf("replay confirmation missing %q:\n%s", want, confirm)
+				}
+			}
+			if strings.Contains(confirm, "--keep-local") || strings.Contains(confirm, "proven to carry") {
+				t.Fatalf("replay confirmation offers ordinary recovery wording:\n%s", confirm)
+			}
+			nextModel, cmd := m.handleKey(keyMsg("enter"))
+			m = nextModel.(Model)
+			if cmd == nil {
+				t.Fatal("confirmed recovery issued no command")
+			}
+			m.Update(cmd())
+			if calls != 1 {
+				t.Fatalf("Recover calls = %d", calls)
+			}
+		})
+	}
+}
