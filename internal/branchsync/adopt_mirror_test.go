@@ -903,6 +903,45 @@ func TestAdoptTerminalHeadInterruptedThenCommittedAdvertisesNoRefusingAction(t *
 	}
 }
 
+// TestAdoptTerminalHeadInterruptedAtPreservedHeadWithMovedLaneAdvertisesNoRefusingAction
+// covers an adoption interrupted after the branch reached the preserved head
+// whose private lane then moved to an unrelated commit: the bound action
+// refuses there, so status must report manual reconciliation instead of an
+// ordinary recovery, and nothing may move.
+func TestAdoptTerminalHeadInterruptedAtPreservedHeadWithMovedLaneAdvertisesNoRefusingAction(t *testing.T) {
+	t.Parallel()
+	f := newStaleMirrorAdoptionFixture(t)
+	request := terminalHeadAdoptionRequest(f)
+	f.service.afterTerminalAdoptionMirrorAnchor = func() { panic("interrupted settlement") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected interruption")
+			}
+		}()
+		f.service.AdoptTerminalHead(f.ctx, request)
+	}()
+	f.service.afterTerminalAdoptionMirrorAnchor = nil
+	mustRun(t, f.gate, "update-ref", "refs/heads/"+f.run.Branch, f.base, f.submitted)
+
+	status := f.service.InspectCached(f.ctx)
+	if status.State != StatePipelineOwned || status.Safety != "blocked_recover_manual_reconciliation" ||
+		status.NextAction == nil || status.NextAction.Code != "inspect_and_reconcile_manually" ||
+		status.Recovery == nil || status.Recovery.Source != "terminal_head_adoption" ||
+		!strings.Contains(status.Error, f.preserved) || !strings.Contains(status.Error, "exact interrupted caller snapshot") {
+		t.Fatalf("status for an interrupted adoption with a moved lane = %#v", status)
+	}
+	if result := f.service.Recover(f.ctx, false); result.Recovered || f.custodyReturned() {
+		t.Fatalf("recover with a moved lane = %#v", result)
+	}
+	if got := f.mirrorLane(); got != f.base {
+		t.Fatalf("refusal moved the lane to %s", got)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("refusal moved HEAD to %s", got)
+	}
+}
+
 func TestAdoptTerminalHeadCallerAnchorDisappearsAfterMirrorMove(t *testing.T) {
 	t.Parallel()
 	f := newStaleMirrorAdoptionFixture(t)

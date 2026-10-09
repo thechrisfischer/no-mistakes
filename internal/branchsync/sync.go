@@ -2759,9 +2759,12 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 		return
 	}
 	if request := terminalHeadAdoptionRequestFor(s.Repo, run); terminalRunStatus(run.Status) && run.TerminalAdoptionAuthorizedAt != nil && run.CustodyReturnedAt == nil &&
-		run.LastPushedSHA == nil && run.PRURL == nil && state.Local.Head != request.CallerHead && state.Local.Head != request.PreservedHead {
+		run.LastPushedSHA == nil && run.PRURL == nil && state.Local.Head != request.CallerHead {
 		state.Safety = "blocked_recover_manual_reconciliation"
 		state.Error = fmt.Sprintf("the recorded terminal-head adoption can continue only from the branch at exactly caller head %s or preserved head %s; preserve later commits and uncommitted work separately and obtain verified recovery guidance; custody was not returned and no files or refs were changed", request.CallerHead, request.PreservedHead)
+		if state.Local.Head == request.PreservedHead {
+			state.Error = fmt.Sprintf("the branch is at authorized preserved head %s, but status cannot verify the recorded terminal-head adoption's exact interrupted state: its fully bound action continues only with the branch clean at that head or holding the exact interrupted caller snapshot of %s, with its history anchors and private mirror lane verified; if the worktree holds that caller snapshot, leave it in place and do not stash, commit, discard, or reapply it; no ordinary or keep-local recovery applies; obtain verified recovery guidance; custody was not returned and no files or refs were changed", request.PreservedHead, request.CallerHead)
+		}
 		state.Recovery = terminalHeadAdoptionEvidence(request, "operator_authorized")
 		state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
 		return

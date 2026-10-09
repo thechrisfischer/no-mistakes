@@ -3253,6 +3253,10 @@ func TestAdoptTerminalHeadInterruptedAttemptsRemainRetryable(t *testing.T) {
 			t.Fatal("post-CAS caller snapshot unexpectedly reads clean against the preserved branch")
 		}
 		f.service.afterRecoverBranchMove = nil
+		if status := f.service.InspectCached(f.ctx); (status.NextAction != nil && status.NextAction.Code == "recover_custody") ||
+			!strings.Contains(status.Error, "exact interrupted caller snapshot") || !strings.Contains(status.Error, "do not stash, commit, discard, or reapply") {
+			t.Fatalf("status for the resumable post-CAS snapshot = %#v", status)
+		}
 		retried := f.service.AdoptTerminalHead(f.ctx, request)
 		if !retried.Recovered || !retried.Changed {
 			t.Fatalf("retry after branch CAS interruption = %#v", retried)
