@@ -1809,3 +1809,89 @@ func TestRebindRunPushedHeadAppliesOnlyToTheVerifiedBinding(t *testing.T) {
 		t.Fatalf("rebind result: head %s pushed %s generation %d", got.HeadSHA, *got.LastPushedSHA, *got.PushGeneration)
 	}
 }
+
+func TestTerminalHeadAdoptionRefusesActiveSibling(t *testing.T) {
+	for _, phase := range []string{"authorize", "complete"} {
+		t.Run(phase, func(t *testing.T) {
+			d := openTestDB(t)
+			repo, err := d.InsertRepo("/terminal-adoption", "git@github.com:user/repo.git", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, err := d.InsertRun(repo.ID, "feature", "caller", "base")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.UpdateRunStatusWithVerifiedHead(run.ID, types.RunFailed, "preserved"); err != nil {
+				t.Fatal(err)
+			}
+			run, _ = d.GetRun(run.ID)
+			auth := TerminalHeadAdoptionAuthorization{RepositoryID: repo.ID, Branch: run.Branch, RunID: run.ID, CallerHeadSHA: "caller", PreservedHeadSHA: "preserved", Status: run.Status, TerminalHeadVerifiedAt: *run.TerminalHeadVerifiedAt}
+			if phase == "complete" {
+				if ok, err := d.AuthorizeTerminalHeadAdoption(auth); err != nil || !ok {
+					t.Fatalf("authorize = %t, %v", ok, err)
+				}
+			}
+			sibling, err := d.InsertRun(repo.ID, run.Branch, "preserved", "base")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.UpdateRunStatus(sibling.ID, types.RunRunning); err != nil {
+				t.Fatal(err)
+			}
+			operation := d.AuthorizeTerminalHeadAdoption
+			if phase == "complete" {
+				operation = d.CompleteTerminalHeadAdoption
+			}
+			if ok, err := operation(auth); err != nil || ok {
+				t.Fatalf("%s with active sibling = %t, %v", phase, ok, err)
+			}
+			got, err := d.GetRun(run.ID)
+			if err != nil || got.CustodyReturnedAt != nil || (phase == "authorize" && got.TerminalAdoptionAuthorizedAt != nil) {
+				t.Fatalf("refusal mutated row: %#v, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestTerminalHeadAdoptionCompletionRechecksEveryPublicationAndCustodyPredicate(t *testing.T) {
+	for _, field := range []string{"push_active", "last_pushed_sha", "pr_url", "custody_returned_at"} {
+		t.Run(field, func(t *testing.T) {
+			d := openTestDB(t)
+			repo, err := d.InsertRepo("/terminal-adoption", "git@github.com:user/repo.git", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, err := d.InsertRun(repo.ID, "feature", "caller", "base")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.UpdateRunStatusWithVerifiedHead(run.ID, types.RunFailed, "preserved"); err != nil {
+				t.Fatal(err)
+			}
+			run, _ = d.GetRun(run.ID)
+			auth := TerminalHeadAdoptionAuthorization{RepositoryID: repo.ID, Branch: run.Branch, RunID: run.ID, CallerHeadSHA: "caller", PreservedHeadSHA: "preserved", Status: run.Status, TerminalHeadVerifiedAt: *run.TerminalHeadVerifiedAt}
+			if ok, err := d.AuthorizeTerminalHeadAdoption(auth); err != nil || !ok {
+				t.Fatalf("authorize = %t, %v", ok, err)
+			}
+			// Each subtest changes exactly one predicate after authorization.
+			if _, err := d.sql.Exec("UPDATE runs SET "+field+" = ? WHERE id = ?", 1, run.ID); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := d.CompleteTerminalHeadAdoption(auth); err != nil || ok {
+				t.Fatalf("complete with %s changed = %t, %v", field, ok, err)
+			}
+			got, err := d.GetRun(run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if field == "custody_returned_at" {
+				if got.CustodyReturnedAt == nil || *got.CustodyReturnedAt != 1 {
+					t.Fatalf("first custody stamp overwritten: %#v", got)
+				}
+			} else if got.CustodyReturnedAt != nil {
+				t.Fatalf("refusal stamped custody: %#v", got)
+			}
+		})
+	}
+}

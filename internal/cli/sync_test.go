@@ -1963,3 +1963,60 @@ func asExitError(err error, target **exitError) bool {
 	}
 	return false
 }
+
+func TestAxiSyncTerminalBindingsRefusePartialAndWrongModesWithoutMutation(t *testing.T) {
+	f := newCLITerminalAdoptionFixture(t)
+	bindings := []string{"--repository", f.repoID, "--branch", "feature/recover", "--terminal-run", f.runID, "--caller-head", f.submitted, "--preserved-head", f.preserved}
+	tests := []struct {
+		name    string
+		args    []string
+		message string
+	}{}
+	for omitted := 0; omitted < len(bindings); omitted += 2 {
+		args := []string{"axi", "sync", "--adopt-terminal-head"}
+		args = append(args, bindings[:omitted]...)
+		args = append(args, bindings[omitted+2:]...)
+		tests = append(tests, struct {
+			name    string
+			args    []string
+			message string
+		}{bindings[omitted], args, "--adopt-terminal-head requires --repository, --branch, --terminal-run, --caller-head, and --preserved-head"})
+	}
+	tests = append(tests, struct {
+		name    string
+		args    []string
+		message string
+	}{"no bindings", []string{"axi", "sync", "--adopt-terminal-head"}, "--adopt-terminal-head requires"})
+	for _, mode := range []string{"", "--recover", "--check"} {
+		args := []string{"axi", "sync"}
+		if mode != "" {
+			args = append(args, mode)
+		}
+		args = append(args, bindings...)
+		tests = append(tests, struct {
+			name    string
+			args    []string
+			message string
+		}{"wrong mode " + mode, args, "terminal-head binding flags require --adopt-terminal-head"})
+	}
+	beforeRefs := cliGit(t, f.local, "show-ref")
+	beforeGate := cliGit(t, f.gate, "show-ref")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := executeCmd(tc.args...)
+			var exit *exitError
+			if !asExitError(err, &exit) || exit.code != 2 || !strings.Contains(out, tc.message) {
+				t.Fatalf("usage refusal: %v\n%s", err, out)
+			}
+			if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+				t.Fatalf("HEAD moved to %s", got)
+			}
+			if got := cliGit(t, f.local, "show-ref"); got != beforeRefs {
+				t.Fatal("local refs mutated")
+			}
+			if got := cliGit(t, f.gate, "show-ref"); got != beforeGate {
+				t.Fatal("gate refs mutated")
+			}
+		})
+	}
+}

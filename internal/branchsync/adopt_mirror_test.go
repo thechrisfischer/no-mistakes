@@ -3,9 +3,13 @@ package branchsync
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/gate"
@@ -44,11 +48,6 @@ func readGitOptional(t *testing.T, dir, ref string) string {
 // reachable from the gate afterwards.
 func assertNextRunMirrorReady(t *testing.T, f *recoverFixture) {
 	t.Helper()
-	for _, ref := range []string{f.anchorRef(), f.localAnchorRef()} {
-		if got := readGitOptional(t, f.gate, ref); got == "" {
-			t.Fatalf("gate lost history anchor %s", ref)
-		}
-	}
 	if got := mustRun(t, f.gate, "rev-parse", f.localAnchorRef()); got != f.submitted {
 		t.Fatalf("gate caller-head anchor = %s, want submitted %s", got, f.submitted)
 	}
@@ -648,5 +647,184 @@ func TestAdoptTerminalHeadReverifiesTheCallerAfterMirrorSettlement(t *testing.T)
 			assertRecoveredRewriteFixture(t, f)
 			assertNextRunMirrorReady(t, f)
 		})
+	}
+}
+
+func TestAdoptTerminalHeadInterruptedStatusRoutesBoundReplay(t *testing.T) {
+	t.Parallel()
+	for _, throughRecover := range []bool{false, true} {
+		t.Run(fmt.Sprint("recover=", throughRecover), func(t *testing.T) {
+			t.Parallel()
+			f := newStaleMirrorAdoptionFixture(t)
+			request := terminalHeadAdoptionRequest(f)
+			f.service.afterTerminalAdoptionMirrorAnchor = func() { panic("interrupted settlement") }
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("expected interruption")
+					}
+				}()
+				f.service.AdoptTerminalHead(f.ctx, request)
+			}()
+			f.service.afterTerminalAdoptionMirrorAnchor = nil
+			status := f.service.InspectCached(f.ctx)
+			if status.NextAction == nil || status.NextAction.Code != "adopt_terminal_head" || status.NextAction.Command != terminalHeadAdoptionCommand(request) || f.custodyReturned() {
+				t.Fatalf("interrupted recovery offer = %#v", status)
+			}
+			if kept := f.service.Recover(f.ctx, true); kept.Recovered || kept.Safety != "blocked_adopt_terminal_keep_local" || f.custodyReturned() || f.mirrorLane() != f.submitted {
+				t.Fatalf("keep-local changed the recorded adoption: %#v", kept)
+			}
+			var result State
+			if throughRecover {
+				result = f.service.Recover(f.ctx, false)
+			} else {
+				result = f.service.AdoptTerminalHead(f.ctx, request)
+			}
+			if !result.Recovered || result.Changed {
+				t.Fatalf("guided replay = %#v", result)
+			}
+			assertNextRunMirrorReady(t, f)
+		})
+	}
+}
+
+func TestAdoptTerminalHeadCompletedStatusOffersOnlyExactStaleLaneReplay(t *testing.T) {
+	t.Parallel()
+	for _, shape := range []string{"exact", "later commit", "dirty", "gate anchor moved", "caller anchor moved", "lane moved"} {
+		t.Run(shape, func(t *testing.T) {
+			t.Parallel()
+			f := newStaleMirrorAdoptionFixture(t)
+			request := terminalHeadAdoptionRequest(f)
+			if result := f.service.AdoptTerminalHead(f.ctx, request); !result.Recovered {
+				t.Fatalf("adoption = %#v", result)
+			}
+			mustRun(t, f.gate, "update-ref", "refs/heads/"+f.run.Branch, f.submitted, f.preserved)
+			switch shape {
+			case "later commit":
+				mustRun(t, f.local, "commit", "--allow-empty", "-m", "later work")
+			case "dirty":
+				mustWrite(t, filepath.Join(f.local, "later.txt"), "uncommitted work\n")
+			case "gate anchor moved":
+				mustRun(t, f.gate, "update-ref", f.anchorRef(), f.base, f.preserved)
+			case "caller anchor moved":
+				mustRun(t, f.local, "update-ref", f.localAnchorRef(), f.base, f.submitted)
+			case "lane moved":
+				mustRun(t, f.gate, "update-ref", "refs/heads/"+f.run.Branch, f.base, f.submitted)
+			}
+			status := f.service.InspectCached(f.ctx)
+			offered := status.NextAction != nil && status.NextAction.Code == "adopt_terminal_head"
+			if offered != (shape == "exact") {
+				t.Fatalf("%s replay offer = %#v", shape, status)
+			}
+			if shape == "exact" {
+				if status.NextAction.Command != terminalHeadAdoptionCommand(request) {
+					t.Fatal("bindings changed")
+				}
+				if result := f.service.AdoptTerminalHead(f.ctx, request); !result.Recovered {
+					t.Fatalf("offered replay = %#v", result)
+				}
+				assertNextRunMirrorReady(t, f)
+			}
+		})
+	}
+}
+
+func TestAdoptTerminalHeadCallerAnchorDisappearsAfterMirrorMove(t *testing.T) {
+	t.Parallel()
+	f := newStaleMirrorAdoptionFixture(t)
+	f.service.afterTerminalAdoptionMirrorMove = func() { mustRun(t, f.gate, "update-ref", "-d", f.localAnchorRef(), f.submitted) }
+	result := f.service.AdoptTerminalHead(f.ctx, terminalHeadAdoptionRequest(f))
+	if result.Recovered || result.Safety != "blocked_adopt_terminal_mirror_race" || f.custodyReturned() {
+		t.Fatalf("anchor race = %#v", result)
+	}
+	if got := f.mirrorLane(); got != f.preserved {
+		t.Fatalf("lane = %s", got)
+	}
+}
+
+func TestAdoptTerminalHeadLaneMovesAfterSettlement(t *testing.T) {
+	t.Parallel()
+	f := newStaleMirrorAdoptionFixture(t)
+	f.service.afterTerminalAdoptionSettlement = func() { mustRun(t, f.gate, "update-ref", "refs/heads/"+f.run.Branch, f.base, f.preserved) }
+	result := f.service.AdoptTerminalHead(f.ctx, terminalHeadAdoptionRequest(f))
+	if result.Recovered || result.Safety != "blocked_adopt_terminal_incomplete" || f.custodyReturned() {
+		t.Fatalf("post-settlement lane race = %#v", result)
+	}
+	if got := f.mirrorLane(); got != f.base {
+		t.Fatalf("concurrent lane overwritten: %s", got)
+	}
+}
+
+func TestAdoptTerminalHeadSiblingRunStartsAtStamp(t *testing.T) {
+	t.Parallel()
+	f := newStaleMirrorAdoptionFixture(t)
+	f.service.completeTerminalAdoption = func(auth db.TerminalHeadAdoptionAuthorization) (bool, error) {
+		sibling, err := f.db.InsertRun(f.repo.ID, f.run.Branch, f.preserved, f.base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.db.UpdateRunStatus(sibling.ID, types.RunRunning); err != nil {
+			t.Fatal(err)
+		}
+		return f.db.CompleteTerminalHeadAdoption(auth)
+	}
+	result := f.service.AdoptTerminalHead(f.ctx, terminalHeadAdoptionRequest(f))
+	if result.Recovered || result.Safety != "blocked_adopt_terminal_stamp_failed" || f.custodyReturned() {
+		t.Fatalf("active sibling at stamp = %#v", result)
+	}
+}
+
+func TestAdoptTerminalHeadResumeRefusesActiveSibling(t *testing.T) {
+	t.Parallel()
+	f := newStaleMirrorAdoptionFixture(t)
+	request := terminalHeadAdoptionRequest(f)
+	f.service.afterRecoverBranchMove = func() { panic("interrupted branch move") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected interruption")
+			}
+		}()
+		f.service.AdoptTerminalHead(f.ctx, request)
+	}()
+	f.service.afterRecoverBranchMove = nil
+	sibling, err := f.db.InsertRun(f.repo.ID, f.run.Branch, f.preserved, f.base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.UpdateRunStatus(sibling.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	before := mustRun(t, f.local, "status", "--porcelain=v1")
+	result := f.service.AdoptTerminalHead(f.ctx, request)
+	if result.Recovered || result.Safety != "blocked_adopt_terminal_assumptions_changed" || f.custodyReturned() {
+		t.Fatalf("resume with active sibling = %#v", result)
+	}
+	if got := mustRun(t, f.local, "status", "--porcelain=v1"); got != before {
+		t.Fatalf("resume changed caller snapshot: %q -> %q", before, got)
+	}
+}
+
+func TestTerminalHeadAdoptionCommandRoundTripsAllBindings(t *testing.T) {
+	t.Parallel()
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX shell unavailable")
+	}
+	request := TerminalHeadAdoptionRequest{
+		RepositoryID: "repo'$(printf repo);\"",
+		Branch:       "feat/it's;$(printf branch)`printf tick`&|<>$HOME",
+		RunID:        "run'\";$(printf run)", CallerHead: "caller'$(printf caller)", PreservedHead: "preserved'`printf preserved`",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, sh, "-c", "set -- "+terminalHeadAdoptionCommand(request)+"; printf '%s\\0' \"$@\"")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("argv echo: %v: %s", err, output)
+	}
+	want := []string{"no-mistakes", "axi", "sync", "--adopt-terminal-head", "--repository", request.RepositoryID, "--branch", request.Branch, "--terminal-run", request.RunID, "--caller-head", request.CallerHead, "--preserved-head", request.PreservedHead}
+	if got := strings.Split(strings.TrimSuffix(string(output), "\x00"), "\x00"); !slices.Equal(got, want) {
+		t.Fatalf("argv = %q, want %q", got, want)
 	}
 }
