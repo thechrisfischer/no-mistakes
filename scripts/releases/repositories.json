@@ -1,0 +1,17 @@
+{
+  "version": "v1",
+  "repositories": {
+    "thechrisfischer/no-mistakes": {
+      "delivery": "vendored",
+      "default_branch": "main",
+      "deployments": [
+        {
+          "workflow": ".github/workflows/docs.yml",
+          "workflow_name": "docs",
+          "job": "deploy",
+          "target": "documentation site"
+        }
+      ]
+    }
+  }
+}
